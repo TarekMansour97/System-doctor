@@ -1,0 +1,638 @@
+import datetime
+import logging
+import queue
+import threading
+import pyodbc
+import psutil
+import pandas as pd
+import GPUtil
+import winreg
+import re
+import time
+import uuid
+import platform
+from sklearn.linear_model import LinearRegression
+
+# Configuration
+valid_sys_id = "MANSOUR"
+conn_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=MANSOUR\MSSQLSERVER01;DATABASE=Final project;Trusted_Connection=yes'
+conn = pyodbc.connect(conn_string)
+cursor = conn.cursor()
+collection_interval = 20
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+            
+def create_db_connection(conn_string):
+    return pyodbc.connect(conn_string)
+
+def close_db_connection(conn, cursor):
+    if cursor:
+        cursor.close()
+    if conn:
+        conn.close()
+
+def get_cpu_usage():
+    return psutil.cpu_percent(interval=1)
+
+def get_ram_usage():
+    return psutil.virtual_memory().percent
+
+def get_disk_usage():
+    return psutil.disk_usage('/').percent
+
+def get_network_usage():
+    net_io_counters = psutil.net_io_counters()
+    return {
+        'bytes_sent': net_io_counters.bytes_sent,
+        'bytes_recv': net_io_counters.bytes_recv,
+        'packets_sent': net_io_counters.packets_sent,
+        'packets_recv': net_io_counters.packets_recv
+    }
+
+def get_os_version():
+    return platform.platform()
+
+def get_gpu_usage():
+    gpus = GPUtil.getGPUs()
+    if gpus:
+        return sum([gpu.load for gpu in gpus]) / len(gpus)
+    return 0.0
+
+def validate_sys_id(cursor, sys_id):
+    cursor.execute("SELECT COUNT(*) FROM SysInfo WHERE SysID = ?", (sys_id,))
+    return cursor.fetchone()[0] > 0
+
+def validate_app_id(cursor, app_id):
+    cursor.execute("SELECT COUNT(*) FROM Application WHERE AppID = ?", (app_id,))
+    return cursor.fetchone()[0] > 0
+
+def insert_sys_info(cursor, conn, sys_id, network_usage, os_version):
+    """Inserts system information into the SysInfo table if it doesn't exist."""
+    cursor.execute("SELECT COUNT(*) FROM SysInfo WHERE SysID = ?", (sys_id,))
+    if cursor.fetchone()[0] == 0:
+        query = """
+        INSERT INTO SysInfo (SysID, NetworkUsage, OSVersion, TimeStamp, BytesSent, BytesRecv, PacketsSent, PacketsRecv)
+        VALUES (?, ?, ?, GETDATE(), ?, ?, ?, ?)
+        """
+        params = (
+            sys_id,
+            os_version,
+            network_usage['bytes_sent'],
+            network_usage['bytes_recv'],
+            network_usage['packets_sent'],
+            network_usage['packets_recv']
+        )
+        cursor.execute(query, params)
+        conn.commit()
+
+def insert_performance_data(cursor, conn, memory_usage, disk_usage, cpu_usage, gpu_usage, sys_id):
+    """Inserts system performance data into the Performance table."""
+    timestamp = datetime.datetime.now()
+    query = """
+    INSERT INTO Performance (MemoryUsage, DiskUsage, CPUUsage, GPUUsage, TimeStamp, SysID)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """
+    params = (memory_usage, disk_usage, cpu_usage, gpu_usage, timestamp, sys_id)
+
+    try:
+        cursor.execute(query, params)
+        conn.commit()
+        print(f"SQL Query executed: {query}, Parameters: {params}")
+    except Exception as e:
+        print(f"Error executing SQL Query: {query}, Parameters: {params}, Error: {e}")
+
+def collect_system_data(cursor, conn, valid_sys_id):  # Added conn as a parameter
+    """Gathers and inserts system data into the database."""
+    try:
+        # Gather system data
+        network_usage = get_network_usage()
+        os_version = get_os_version()
+        cpu_usage = get_cpu_usage()
+        gpu_usage = get_gpu_usage()
+        ram_usage = get_ram_usage()
+        disk_usage = get_disk_usage()
+        print(f"Collected System Data: CPU={cpu_usage}, RAM={ram_usage}, Disk={disk_usage}, GPU={gpu_usage}")
+
+        # Insert the collected system data into the database
+        insert_performance_data(cursor, conn, ram_usage, disk_usage, cpu_usage, gpu_usage, valid_sys_id)  # Pass conn here
+        insert_sys_info(cursor, conn, valid_sys_id, network_usage, os_version)  # Ensure this is also correctly updated
+
+        return network_usage, os_version, cpu_usage, ram_usage, disk_usage, gpu_usage
+    except Exception as e:
+        print(f"Error collecting system data: {e}")
+        return None
+
+def analyze_system_data(data, cursor):
+    """Analyzes collected system data, generates alerts, and performs predictive analysis."""
+    try:
+        # Insert performance data into the database
+        sys_id = "MANSOUR"
+
+        insert_performance_data(cursor, data["RAMUsage"], data["DiskUsage"], data["CPUUsage"], data["GPUUsage"], sys_id)
+        print("Performance data inserted into the database.")
+
+        # Initialize thresholds
+        thresholds = {
+            "CPUUsage": 90,
+            "RAMUsage": 90,
+            "DiskUsage": 95,
+            "GPUUsage": 90
+        }
+
+        # Analyze data and generate alerts
+        alerts = []
+        for metric, value in data.items():
+            if metric in thresholds and isinstance(value, (float, int)) and value > thresholds[metric]:
+                alerts.append(f"High {metric} detected: {value}%")
+
+        print("Data analyzed, alerts generated.")
+
+        # Predictive analysis
+        metrics_to_predict = ["CPUUsage", "GPUUsage", "RAMUsage", "DiskUsage"]
+        for metric_to_predict in metrics_to_predict:
+            historical_data = fetch_historical_data(metric_to_predict)
+            if historical_data is not None:
+                X = historical_data.index.values.reshape(-1, 1)
+                y = historical_data[metric_to_predict]
+
+                model = LinearRegression()
+                model.fit(X, y)
+
+                next_timestamp = data["timestamp"] + collection_interval
+                predicted_value = model.predict([[next_timestamp]])[0]
+
+                if predicted_value > thresholds[metric_to_predict]:
+                    alerts.append(f"Predicted {metric_to_predict} usage ({predicted_value:.2f}%) might exceed threshold in the next interval")
+
+        print("Predictive analysis completed.")
+        return alerts
+    except Exception as e:
+        print(f"Error analyzing system data: {e}")
+        return []
+
+def fetch_historical_data(metric_name):
+    # It's better to use a global or passed connection string to avoid reconnecting to the database each time
+    global conn_string
+
+    # Use parameterized queries or proper handling to avoid SQL injection
+    if metric_name not in ["CPUUsage", "RAMUsage", "DiskUsage", "GPUUsage"]:  # Example metric names
+        print("Invalid metric name")
+        return None
+
+    try:
+        with pyodbc.connect(conn_string) as conn:
+            cursor = conn.cursor()
+
+            # Safe query using parameter substitution is not directly possible for column names,
+            # so ensure metric_name is validated against a list of allowed values
+            query = f"""
+            SELECT Timestamp, {metric_name}, GPUUsage
+            FROM Performance
+            WHERE {metric_name} IS NOT NULL
+            ORDER BY Timestamp
+            """
+            cursor.execute(query)
+            results = cursor.fetchall()
+
+            # Check if results are empty
+            if not results:
+                return None
+
+            # Create a DataFrame from the results
+            historical_data = pd.DataFrame(results, columns=["Timestamp", metric_name, "GPUUsage"])
+            historical_data.set_index("Timestamp", inplace=True)
+
+            return historical_data
+    except Exception as e:
+        print(f"Error fetching historical data: {e}")
+        return None
+
+def get_event_log_entries():
+    # Use the global variable for SysID
+    global valid_sys_id
+
+    # Connect to the event log
+    try:
+        event_log = winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE)
+        root = winreg.OpenKey(event_log, 'SYSTEM\\CurrentControlSet\\Services\\EventLog')
+
+        # Iterate over event logs
+        for i in range(winreg.QueryInfoKey(root)[0]):  # Simplified range call
+            try:
+                event_key = winreg.EnumKey(root, i)
+                event_source = winreg.OpenKey(root, event_key)
+
+                # Collect logs from the current event source
+                event_logs = []
+                for j in range(winreg.QueryInfoKey(event_source)[1]):
+                    value_name, value_data, _ = winreg.EnumValue(event_source, j)
+
+                    # Attempt to fetch or generate an AppID for the event source
+                    app_id = fetch_or_generate_app_id(cursor, event_key)
+
+                    event_log_entry = {
+                        'Source': event_key,
+                        'Message': value_data,
+                        'SysID': valid_sys_id, 
+                        'AppID': app_id,
+                        'timestamp': datetime.datetime.now()
+                    }
+                    event_logs.append(event_log_entry)
+
+                yield event_logs
+            except FileNotFoundError as e:
+                logging.error(f"File not found error: {e}")
+            finally:
+                if 'event_source' in locals():
+                    winreg.CloseKey(event_source)
+    finally:
+        if 'root' in locals():
+            winreg.CloseKey(root)
+        if 'event_log' in locals():
+            winreg.CloseKey(event_log)
+
+def get_application_logs():
+    # It's more efficient to create a single connection outside of the loop
+    conn = pyodbc.connect(conn_string)
+    cursor = conn.cursor()
+
+    # Retrieve application logs from running processes
+    application_logs = []
+    for process in psutil.process_iter(['name', 'pid']):  # Include 'pid' in the initial query
+        if process.info['pid'] is not None:  # Check if 'pid' is not None instead of checking if key exists
+            app_id = fetch_or_generate_app_id(cursor, process.info['name'])
+            # Modify to include a descriptive message
+            application_log = {
+                'Source': process.info['name'],  # Use process name as the source
+                'Message': f"Running process: {process.info['name']}",  # Example of a descriptive message
+                'SysID': "MANSOUR",
+                'AppID': app_id
+            }
+            application_logs.append(application_log)
+
+
+    # Close the cursor and connection after finishing the loop
+    cursor.close()
+    conn.close()
+
+def collect_logs(valid_sys_id):
+    # Use the global connection string
+    global conn_string
+
+    # Create a new connection for this thread
+    with pyodbc.connect(conn_string) as conn:
+        cursor = conn.cursor()
+
+        try:
+            # Retrieve logs from the system or application
+            event_log_entries = get_event_log_entries()
+            application_logs = get_application_logs()
+
+            # Combine the processing of event and application logs to reduce code duplication
+            all_logs = list(event_log_entries) + [application_logs]
+
+            for log_group in all_logs:
+                for log in log_group:
+                    # Correctly use datetime.now() to get the current time
+                    timestamp = log.get('timestamp', datetime.datetime.now())
+                    app_name = log.get('Source', 'Unknown')  # Provide a default value in case 'Source' is missing
+
+                    # Fetch or generate AppID, ensuring app_name is passed correctly
+                    app_id = fetch_or_generate_app_id(cursor, app_name)
+
+                    # Insert the log entry into the database using a parameterized query
+                    query = """
+                    INSERT INTO LogData (Timestamp, Source, Message, SysID, AppID)
+                    VALUES (?, ?, ?, ?, ?)
+                    """
+                    cursor.execute(query, (timestamp, app_name, log.get('Message', ''), valid_sys_id, app_id))
+
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Error in collect_logs: {e}")
+
+def fetch_or_generate_app_id(cursor, app_name):
+    try:
+        # Fetch the AppID for the given application name from the Application table
+        query_select = "SELECT AppID FROM Application WHERE AppName = ?"
+        params_select = (app_name,)
+        cursor.execute(query_select, params_select)
+        app_id = cursor.fetchone()
+
+        if app_id is None:
+            # Generate a new UUID
+            app_id = str(uuid.uuid4())  # Convert UUID to string
+
+            # Insert the new AppID into the Application table
+            query_insert = "INSERT INTO Application (AppID, AppName) VALUES (?, ?)"
+            params_insert = (app_id, app_name)
+            cursor.execute(query_insert, params_insert)
+            cursor.connection.commit()  # Assuming cursor is part of a connection that can be committed
+
+            print(f"SQL Query executed: {query_insert}, Parameters: {params_insert}")
+        else:
+            app_id = app_id[0]  # Extract the AppID from the tuple
+
+        return app_id
+
+    except Exception as e:
+        # Improved error handling to avoid reference before assignment error
+        error_message = f"Error in fetch_or_generate_app_id: {e}"
+        print(error_message)
+        # Return None or raise an exception depending on your error handling strategy
+        return None
+
+def collect_and_store_logs(cursor, valid_sys_id):
+    # Retrieve logs from the system or application
+    event_log_entries = get_event_log_entries()  # get_event_log_entries is a generator
+    application_logs = get_application_logs()
+
+    # Combine event and application logs for streamlined processing
+    all_logs = list(event_log_entries) + [application_logs]
+
+    for log_group in all_logs:
+        for log in log_group:
+            # Use a common timestamp if missing
+            timestamp = log.get('timestamp', datetime.datetime.now())
+
+            # Convert non-string Message data to a string
+            if isinstance(log['Message'], list):
+                log['Message'] = ', '.join(map(str, log['Message']))  # Convert list items to string and join
+
+            # Fetch or generate AppID if missing or invalid
+            app_id = log.get('AppID', fetch_or_generate_app_id(cursor, log['Source']))
+            sys_id = valid_sys_id
+
+            # Validate SysID and AppID (assuming these functions return boolean values)
+            if validate_sys_id(cursor, valid_sys_id) and validate_app_id(cursor, app_id):
+                # Debugging: Log the values being inserted
+                logging.debug(f"Inserting log entry: Timestamp={timestamp}, Source={log['Source']}, Message={log['Message']}, SysID={valid_sys_id}, AppID={app_id}")
+
+                # Insert the log entry into the database using a parameterized query
+                query = """
+                INSERT INTO LogData (Timestamp, Source, Message, SysID, AppID)
+                VALUES (?, ?, ?, ?, ?)
+                """
+                try:
+                    cursor.execute(query, (timestamp, log['Source'], log['Message'], valid_sys_id, app_id))
+                except Exception as e:
+                    logging.error(f"Error inserting log entry: {e}")
+            else:
+                logging.error(f"Invalid SysID or AppID for log entry: {log}")
+
+    # Commit once after all inserts to improve performance
+    cursor.connection.commit()
+
+def process_and_analyze_logs(cursor):
+    # Retrieve all logs from the LogData table
+    cursor.execute('SELECT * FROM LogData')
+    logs = cursor.fetchall()
+
+    if not logs:
+        print("No logs to process.")
+        return
+
+    # Convert logs to a pandas DataFrame
+    df = pd.DataFrame(logs, columns=['Timestamp', 'Source', 'Message', 'SysID', 'AppID', 'CPU', 'Memory', 'Disk I/O', 'GPU'])
+
+    # Parse timestamp
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+
+    # Define resource usage thresholds
+    thresholds = {
+        'CPU': 90,
+        'Memory': 95,
+        'Disk I/O': 90,
+        'GPU': 95,
+    }
+
+    # Analyze resource usage patterns and generate recommendations directly
+    for resource, threshold in thresholds.items():
+        high_usage_df = df[df[resource] > threshold]
+        for component in high_usage_df['Source'].unique():
+            print(f"Optimization Recommendation: Increase {resource} allocation for component '{component}'")
+
+    # Analyze error messages
+    error_messages = [
+        'out of memory',
+        'out of disk space',
+        'CPU overload',
+        'resource deadlock',
+        'race condition',
+        'lock contention',
+        'excessive memory allocation',
+        'unnecessary I/O operations',
+        'GPU bottleneck',  # Add GPU-related error message
+    ]
+    df_error_messages = df[df['Message'].isin(error_messages)]
+    for error_message in df_error_messages['Message'].unique():
+        print(f"Optimization Recommendation: Address the error message '{error_message}'")
+
+    # Store processed logs to the ProcessedLogs table
+    try:
+        for index, row in df.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO ProcessedLogs (Timestamp, Source, Message, SysID, AppID, CPU, Memory, DiskIO, GPU)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (row['Timestamp'], row['Source'], row['Message'], row['SysID'], row['AppID'],
+                 row['CPU'], row['Memory'], row['Disk I/O'], row['GPU'])
+            )
+        cursor.connection.commit()
+    except Exception as e:
+        print(f"Error while inserting into ProcessedLogs: {e}")
+
+
+        
+def insert_error_log(conn, cursor, error_message, error_level, sys_id, app_id):
+    """Inserts error log into the ErrorLog table."""
+    try:
+        if validate_sys_id(cursor, sys_id) and validate_app_id(cursor, app_id):
+            timestamp = datetime.datetime.now()
+            cursor.execute("INSERT INTO ErrorLog (ErrorMessage, ErrorLevel, TimeStamp, SysID, AppID) VALUES (?, ?, ?, ?, ?)",
+                           (error_message, error_level, timestamp, str(sys_id), str(app_id)))
+            conn.commit()
+        else:
+            logging.error(f"Invalid SysID or AppID for error log: SysID={sys_id}, AppID={app_id}")
+    except Exception as e:
+        logging.error(f"Error inserting error log: {e}")
+
+def collect_and_analyze_data(cursor, conn, valid_sys_id, alerts_queue, collection_interval):
+    while True:
+        try:
+            # Collect system data
+            network_usage, os_version, cpu_usage, ram_usage, disk_usage, gpu_usage = collect_system_data(cursor, conn, valid_sys_id)
+            # Analyze data and generate alerts
+            data = {
+                "CPUUsage": cpu_usage, 
+                "RAMUsage": ram_usage,  
+                "DiskUsage": disk_usage,  
+                "GPUUsage": gpu_usage,  
+                "timestamp": datetime.datetime.now() 
+            }
+            alerts = analyze_system_data(data, cursor)  # Pass data to generate alerts
+
+            # Put alerts into the queue
+            for alert in alerts:
+                alerts_queue.put(alert)
+
+            # Sleep for the specified interval
+            time.sleep(collection_interval)
+        except Exception as e:
+            logging.error(f"Error in collect_and_analyze_data: {e}")
+            # Decide on whether to continue or break based on the error
+
+def check_and_insert_applications(conn, cursor):
+    """
+    Checks all running applications and inserts them into the Application table
+    if they are not already present.
+    
+    Args:
+        conn (pyodbc.Connection): The database connection.
+        cursor (pyodbc.Cursor): The database cursor.
+    """
+    for process in psutil.process_iter(['pid', 'name']):
+        try:
+            app_name = process.info['name']
+            # Check if the application is already in the database
+            query_select = "SELECT AppID FROM Application WHERE AppName = ?"
+            params_select = (app_name,)
+            cursor.execute(query_select, params_select)
+            app_id = cursor.fetchone()
+
+            if app_id is None:
+                # If not, insert the new application
+                app_id = str(uuid.uuid4())  # Generate a new UUID for the application
+                query_insert = "INSERT INTO Application (AppID, AppName) VALUES (?, ?)"
+                params_insert = (app_id, app_name)
+                cursor.execute(query_insert, params_insert)
+                conn.commit()
+                print(f"New AppID generated for {app_name}: {app_id}")
+            else:
+                app_id = app_id[0]  # Extract the AppID from the tuple
+
+            print(f"AppID for {app_name}: {app_id}")
+
+        except psutil.NoSuchProcess:
+            continue  # Skip to the next process if the process no longer exists
+        except pyodbc.Error as e:
+            logging.error(f"Database error: {e}")
+            continue  # Skip to the next process or handle the error as needed
+
+def store_alerts(cursor, alerts):
+    for alert in alerts:
+        # Attempt to match the expected format "MetricName usage (Value) Message"
+        match = re.match(r"(.*) usage \((\d+(\.\d+)?)\) (.*)", alert)
+        if match:
+            metric = match.group(1)
+            value = float(match.group(2))
+            Message = match.group(4)
+            # Insert the parsed metric, value, and message into the AlertLog table
+            # Ensure that valid_sys_id is a valid SysID
+            if validate_sys_id(cursor, valid_sys_id):
+                query = """
+                    INSERT INTO AlertLog (Timestamp, Metric, Value, Message, SysID)
+                    VALUES (GETDATE(), ?, ?, ?, ?)
+                """
+                params = (metric, value, Message, valid_sys_id)
+                try:
+                    cursor.execute(query, params)
+                    cursor.commit()
+                    print(f"SQL Query executed: {query}, Parameters: {params}")
+                except Exception as e:
+                    print(f"Error executing SQL Query: {query}, Parameters: {params}, Error: {e}")
+        else:
+            # If the alert does not match the expected format, insert the message only
+            # Ensure that valid_sys_id is a valid SysID
+            if validate_sys_id(cursor, valid_sys_id):
+                query = """
+                    INSERT INTO AlertLog (Timestamp, Message, SysID)
+                    VALUES (GETDATE(), ?, ?)
+                """
+                params = (alert, valid_sys_id)
+                try:
+                    cursor.execute(query, params)
+                    cursor.commit()
+                    print(f"SQL Query executed: {query}, Parameters: {params}")
+                except Exception as e:
+                    print(f"Error executing SQL Query: {query}, Parameters: {params}, Error: {e}")
+
+def export_log_data_to_excel(table_name, filename):
+    """Exports data from the specified log table to an Excel file.
+
+    Args:
+        table_name (str): Name of the log table to export.
+        filename (str): Desired filename for the Excel file.
+
+    Returns:
+        bool: True if export succeeded, False otherwise.
+    """
+
+    try:
+        # Establish database connection
+        conn_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=MANSOUR\MSSQLSERVER01;DATABASE=Final project;Trusted_Connection=yes'  # Replace with your connection string
+        with pyodbc.connect(conn_string) as conn:
+            # Fetch data from the specified table
+            with conn.cursor() as cursor:
+                query = f"SELECT * FROM {table_name}"
+                cursor.execute(query)
+                data = cursor.fetchall()
+
+                # Create a DataFrame and export to Excel
+                df = pd.DataFrame(data, columns=cursor.description)
+                df.to_excel(filename, index=False)  # Set index=False to avoid extra index column
+
+        return True
+
+    except Exception as e:
+        print(f"Error during export: {e}")
+        return False
+
+def periodic_tasks(conn_string, valid_sys_id, alerts_queue):
+    """Performs periodic tasks including data collection, analysis, and alert processing."""
+    conn = pyodbc.connect(conn_string)
+    cursor = conn.cursor()
+    try:
+        # Collect system data
+        data = collect_system_data(cursor, conn, valid_sys_id)
+        logging.info(f"Collected System Data: {data}")
+
+        # Analyze system data and generate alerts
+        alerts = analyze_system_data(data, cursor)
+        logging.info(f"Generated Alerts: {alerts}")
+
+            # Process alerts from the queue
+        for alert in alerts:
+            alerts_queue.put(alert)
+
+            # Collect and store logs
+        collect_and_store_logs(cursor, valid_sys_id)
+
+    except Exception as e:
+        logging.error(f"Error in periodic tasks: {e}")
+    finally:
+        cursor.close()
+        conn.close()  # Ensure the connection is closed in the finally block
+
+def main(conn_string, valid_sys_id):
+    try:
+        alerts_queue = queue.Queue()
+        threads = [
+            threading.Thread(target=collect_logs, args=(valid_sys_id,)),
+            threading.Thread(target=periodic_tasks, args=(conn_string, valid_sys_id, alerts_queue))
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)  # Timeout after 30 seconds
+
+        logging.info("Monitoring program completed successfully.")
+    except Exception as e:
+        logging.error(f"Error in main function: {e}")
+
+if __name__ == "__main__":
+    conn_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=MANSOUR\MSSQLSERVER01;DATABASE=Final project;Trusted_Connection=yes'
+    valid_sys_id = "MANSOUR"
+    main(conn_string, valid_sys_id)
